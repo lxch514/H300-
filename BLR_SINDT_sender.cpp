@@ -1,7 +1,6 @@
-// BLR-4000 + SINDT-485 双传感器  UDP发送 同一串口
+// BLR-4000 + SINDT-485 双传感器 + UDP发送
 // 编译: g++ -std=c++11 -o BLR_SINDT_sender BLR_SINDT_sender.cpp -lpthread
-// 运行: ./BLR_SINDT_sender 
-//       ./BLR_SINDT_sender /dev/ttyS0 9600 0x53 0x65
+// 运行: ./BLR_SINDT_sender /dev/ttyS0 9600 0x53 0x65
 
 #include <iostream>
 #include <string>
@@ -19,27 +18,28 @@
 #include <iomanip>
 #include <cstdlib>
 #include <ctime>
+#include <pthread.h>   // 新增：用于看门狗线程
 
 // ============================================================
 // 0. UDP 配置
 // ============================================================
 #define TARGET_IP "192.168.100.1"
-#define TARGET_PORT 8888
+#define TARGET_PORT 8080
 
 // ============================================================
 // 1. 数据结构（发送给AP）
 // ============================================================
 #pragma pack(push, 1)
 struct SensorData {
-    uint32_t seq;           // 包序号
-    uint64_t timestamp_ms;  // 采集时间戳（毫秒）
-    float distance_m;       // 距离（米），-1表示超量程
-    bool blr_ok;            // BLR读取成功标志
-    float roll;             // 横滚角（度）
-    float pitch;            // 俯仰角（度）
-    float yaw;              // 偏航角（度）
-    bool sint_ok;           // SINDT读取成功标志
-    uint16_t crc;           // 简单校验（保留）
+    uint32_t seq;
+    uint64_t timestamp_ms;
+    float distance_m;
+    bool blr_ok;
+    float roll;
+    float pitch;
+    float yaw;
+    bool sint_ok;
+    uint16_t crc;
 };
 #pragma pack(pop)
 
@@ -310,9 +310,36 @@ uint64_t get_timestamp_ms() {
 }
 
 // ============================================================
-// 8. 主程序
+// 8. 软件看门狗
 // ============================================================
 static volatile bool running = true;
+static volatile uint32_t heartbeat = 0;      // 主循环心跳计数器
+static volatile bool watchdog_triggered = false;
+
+void* watchdog_thread_func(void* arg) {
+    (void)arg;
+    uint32_t last_heartbeat = 0;
+    int timeout_count = 0;
+    
+    while (!watchdog_triggered && running) {
+        sleep(2);  // 每2秒检查一次
+        
+        if (heartbeat == last_heartbeat) {
+            timeout_count++;
+            std::cerr << "[WATCHDOG] 主循环无响应 " << timeout_count << " 次" << std::endl;
+            if (timeout_count >= 3) {  // 6秒无变化，判定为卡死
+                std::cerr << "[WATCHDOG]  主循环卡死! 程序即将退出..." << std::endl;
+                watchdog_triggered = true;
+                running = false;
+                exit(1);  // 主动退出，让外部脚本重启
+            }
+        } else {
+            timeout_count = 0;
+            last_heartbeat = heartbeat;
+        }
+    }
+    return nullptr;
+}
 
 void signal_handler(int sig) {
     (void)sig;
@@ -356,13 +383,14 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "==================================================" << std::endl;
-    std::cout << "  BLR-4000 + SINDT-485 + UDP发送 " << std::endl;
+    std::cout << "  BLR-4000 + SINDT-485 + UDP发送 + 看门狗" << std::endl;
     std::cout << "==================================================" << std::endl;
     std::cout << "  串口      : " << port << std::endl;
     std::cout << "  波特率    : " << baudrate << std::endl;
     std::cout << "  BLR-4000  : 0x" << std::hex << (int)addr_BLR << std::dec << std::endl;
     std::cout << "  SINDT-485 : 0x" << std::hex << (int)addr_SINDT << std::dec << std::endl;
     std::cout << "  目标IP    : " << TARGET_IP << ":" << TARGET_PORT << std::endl;
+    std::cout << "  看门狗    : 已启用 (6秒无响应自动退出)" << std::endl;
     std::cout << "==================================================" << std::endl;
 
     // ---------- 打开串口 ----------
@@ -376,6 +404,13 @@ int main(int argc, char** argv) {
     UDPSender udp;
     if (!udp.init(TARGET_IP, TARGET_PORT)) {
         std::cerr << "UDP初始化失败!" << std::endl;
+        return -1;
+    }
+
+    // ---------- 启动看门狗线程 ----------
+    pthread_t watchdog_thread;
+    if (pthread_create(&watchdog_thread, nullptr, watchdog_thread_func, nullptr) != 0) {
+        std::cerr << "看门狗线程创建失败!" << std::endl;
         return -1;
     }
 
@@ -410,9 +445,15 @@ int main(int argc, char** argv) {
             std::cerr << "[STA] UDP发送失败!" << std::endl;
         }
 
+        // ----- 喂狗：更新心跳计数器 -----
+        heartbeat++;
+
         usleep(500000);  // 0.5秒采集一次
     }
 
+    // ---------- 清理 ----------
+    running = false;
+    pthread_join(watchdog_thread, nullptr);
     serial.close();
     std::cout << std::endl << "程序已退出" << std::endl;
     return 0;

@@ -1,4 +1,4 @@
-// BLR-4000 + SINDT-485 双传感器 UDP接收 同一串口 
+// BLR-4000 + SINDT-485 双传感器 UDP接收
 // 编译: g++ -std=c++11 -o BLR_SINDT_receiver BLR_SINDT_receiver.cpp
 // 运行: ./BLR_SINDT_receiver
 
@@ -10,9 +10,14 @@
 #include <unistd.h>
 #include <signal.h>
 #include <iomanip>
+#include <chrono>  
 
-#define PORT 8888
+#define PORT 8080
 #define BUFFER_SIZE 2048
+
+// 看门狗超时配置
+#define WATCHDOG_TIMEOUT_SEC  5   // 5秒无数据告警
+#define WATCHDOG_EXIT_SEC    30   // 30秒无数据自动退出
 
 #pragma pack(push, 1)
 struct SensorData {
@@ -33,6 +38,12 @@ static volatile bool running = true;
 void signal_handler(int sig) {
     (void)sig;
     running = false;
+}
+
+// 获取当前时间（毫秒）
+uint64_t get_current_ms() {
+    auto now = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 }
 
 int main() {
@@ -61,9 +72,11 @@ int main() {
     }
 
     std::cout << "==================================================" << std::endl;
-    std::cout << "  BLR-4000 + SINDT-485 UDP接收 " << std::endl;
+    std::cout << "  BLR-4000 + SINDT-485 UDP接收 + 通信看门狗" << std::endl;
     std::cout << "==================================================" << std::endl;
     std::cout << "  监听端口: " << PORT << std::endl;
+    std::cout << "  看门狗  : " << WATCHDOG_TIMEOUT_SEC << "秒告警, " 
+              << WATCHDOG_EXIT_SEC << "秒自动退出" << std::endl;
     std::cout << "  等待数据..." << std::endl;
     std::cout << "==================================================" << std::endl;
 
@@ -71,15 +84,43 @@ int main() {
     uint32_t last_seq = 0;
     int lost_total = 0;
 
+    // ---------- 通信看门狗变量 ----------
+    uint64_t last_recv_time = get_current_ms();
+    bool first_packet_received = false;
+
     while (running) {
+        // ----- 设置超时，避免 recvfrom 永久阻塞 -----
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
         memset(buffer, 0, BUFFER_SIZE);
         int n = recvfrom(sockfd, buffer, BUFFER_SIZE, 0,
                          (struct sockaddr*)&client_addr, &addr_len);
 
+        uint64_t now = get_current_ms();
+
         if (n < 0) {
-            perror("recvfrom error");
+            // recvfrom 超时或出错，检查看门狗
+            if (first_packet_received) {
+                uint64_t elapsed = now - last_recv_time;
+                if (elapsed > WATCHDOG_TIMEOUT_SEC * 1000) {
+                    std::cout << "[WATCHDOG]   " << (elapsed / 1000) 
+                              << "秒未收到数据 (阈值: " << WATCHDOG_TIMEOUT_SEC << "秒)" << std::endl;
+                }
+                if (elapsed > WATCHDOG_EXIT_SEC * 1000) {
+                    std::cout << "[WATCHDOG]  " << WATCHDOG_EXIT_SEC 
+                              << "秒未收到数据，连接中断，程序退出!" << std::endl;
+                    break;
+                }
+            }
             continue;
         }
+
+        // ----- 收到数据，更新看门狗 -----
+        first_packet_received = true;
+        last_recv_time = now;
 
         if (n != sizeof(SensorData)) {
             std::cout << "[AP] 收到 " << n << " 字节，格式不匹配 (期望 " 
