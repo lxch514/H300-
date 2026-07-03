@@ -30,7 +30,7 @@ struct SensorData {
     uint32_t seq;           // 包序号
     uint64_t timestamp_ms;  // 采集时间戳（毫秒）
     int32_t distance_mm;    // 距离值（mm），-1表示超量程
-    uint16_t crc;           // 简单校验（可选）
+    uint16_t crc;           // 简单校验
 };
 #pragma pack(pop)
 
@@ -364,7 +364,7 @@ int main(int argc, char** argv) {
 
         if (sensor.readDistance(distance_mm)) {
             data.distance_mm = distance_mm;
-            // 简单CRC校验（可选）
+            // 简单CRC校验
             data.crc = 0;
         } else {
             data.distance_mm = 0;  // 读取失败标记
